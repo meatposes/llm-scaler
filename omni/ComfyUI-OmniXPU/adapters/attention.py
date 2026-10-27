@@ -591,6 +591,36 @@ def _is_batched_self_cute_shape(b, heads, dim_head, q_len, kv_len, dtype):
     )
 
 
+def _compact_row_strided_bhld(tensor, batch, heads, seq, dim_head):
+    """Copy a fused-QKV view into a dense BLHD-backed BHLD tensor.
+
+    Z-Image and Flux split one QKV projection and pass V (Z-Image) or Q/K/V
+    (Flux) as views of it: rows are ``k * heads * dim_head`` wide, so the batch
+    stride is ``seq * k * heads * dim_head``. The CUTE kernel accepts that only
+    for the B1/H56 MiniMax H3 layout. One row-contiguous copy costs far less
+    than the kernel saves over Torch SDPA for these shapes (B50: cute+copy
+    6-11% faster than SDPA at B2/B3, heads 24/30). Returns None for any other
+    layout.
+    """
+    if _is_dense_bhld(tensor, batch, heads, seq, dim_head):
+        return tensor
+    try:
+        shape = tuple(tensor.shape)
+        strides = tuple(tensor.stride())
+    except (AttributeError, TypeError):
+        return None
+    if not (
+        shape == (batch, heads, seq, dim_head)
+        and len(strides) == 4
+        and strides[3] == 1
+        and strides[1] == dim_head
+        and strides[2] > heads * dim_head
+        and strides[0] == seq * strides[2]
+    ):
+        return None
+    return tensor.transpose(1, 2).contiguous().transpose(1, 2)
+
+
 def _prepare_bmg_d128_bhld_cute(
     q,
     k,
@@ -703,6 +733,14 @@ def _prepare_bmg_d128_bhld_cute(
         _is_minimax_h3_h56_bhld(tensor, q_len)
         for tensor in (q_bhld, k_bhld, v_bhld)
     )
+    if not (dense_layouts or minimax_h3_layouts) and batched_self_attention and mask is None:
+        compacted = tuple(
+            _compact_row_strided_bhld(tensor, b, heads, q_len, dim_head)
+            for tensor in (q_bhld, k_bhld, v_bhld)
+        )
+        if all(tensor is not None for tensor in compacted):
+            q_bhld, k_bhld, v_bhld = compacted
+            dense_layouts = True
     if not (dense_layouts or minimax_h3_layouts):
         return None
 

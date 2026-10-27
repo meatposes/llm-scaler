@@ -888,6 +888,83 @@ def test_bmg_batched_self_unadmitted_shapes_keep_torch(
     assert patch.get_stats()["fallback"] == 1
 
 
+def _fused_qkv_view(batch, heads, seq, parts=3):
+    """[B,H,L,128] view of one third of a [B,L,parts*H*128] QKV projection."""
+    width = heads * 128
+    return _FakeTensor(
+        seq=seq,
+        heads=heads,
+        batch=batch,
+        stride=(seq * parts * width, 128, parts * width, 1),
+    )
+
+
+@pytest.mark.parametrize(
+    ("heads", "seq", "strided"),
+    [
+        (30, 4128, ("v",)),            # Z-Image: normed/roped Q/K, V views QKV
+        (24, 4608, ("q", "k", "v")),   # Flux: Q/K/V all view QKV
+    ],
+)
+def test_bmg_batched_self_compacts_fused_qkv_views(
+    monkeypatch, heads, seq, strided
+):
+    monkeypatch.delenv("OMNIXPU_D128_BATCHED_SELF", raising=False)
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    tensors = {
+        name: _fused_qkv_view(2, heads, seq)
+        if name in strided
+        else _FakeTensor(seq=seq, heads=heads, batch=2)
+        for name in ("q", "k", "v")
+    }
+    result = attention.optimized_attention(
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        heads=heads,
+        skip_reshape=True,
+    )
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute_d128_bhld"]
+    assert patch.get_stats()["fallback"] == 0
+    assert patch.get_stats()["routes"] == {"bmg_b2_bf16_d128_self": 1}
+
+
+def test_bmg_fused_qkv_view_keeps_torch_outside_batched_route(monkeypatch):
+    monkeypatch.setenv("OMNIXPU_D128_BATCHED_SELF", "0")
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=4128, heads=32, batch=2)
+    v = _fused_qkv_view(2, 32, 4128)
+    result = attention.optimized_attention(
+        q,
+        q,
+        v,
+        heads=32,
+        skip_reshape=True,
+    )
+    assert result == "torch-output"
+    assert calls == ["torch"]
+    assert patch.get_stats()["routes"] == {}
+
+
+def test_bmg_batched_self_masked_fused_qkv_keeps_torch(monkeypatch):
+    monkeypatch.delenv("OMNIXPU_D128_BATCHED_SELF", raising=False)
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=4128, heads=30, batch=2)
+    v = _fused_qkv_view(2, 30, 4128)
+    result = attention.optimized_attention(
+        q,
+        q,
+        v,
+        heads=30,
+        mask=_FakeMask(4128, 4128),
+        skip_reshape=True,
+    )
+    assert result == "torch-output"
+    assert calls == ["torch"]
+    assert patch.get_stats()["routes"] == {}
+
+
 def test_bmg_b1_self_keeps_legacy_cute_route(monkeypatch):
     patch, attention, calls = _load_patch(monkeypatch, target="bmg")
     tensor = _FakeTensor(seq=14080, heads=32, batch=1)
