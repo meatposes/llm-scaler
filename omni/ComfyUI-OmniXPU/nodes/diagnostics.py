@@ -125,6 +125,10 @@ class OmniXPUStatus:
                     )
                     for r, c in sorted(stats["reasons"].items(), key=lambda x: -x[1]):
                         lines.append(f"    {r}: {c}")
+                    for r, c in sorted(
+                        stats.get("routes", {}).items(), key=lambda x: -x[1]
+                    ):
+                        lines.append(f"    route {r}: {c}")
             except Exception:
                 pass
 
@@ -146,4 +150,7 @@ class OmniXPUStatus:
             except Exception:
                 pass
 
-        return ("\n".join(lines),)
+        # Also return the text as UI output so it is visible in the node and
+        # in /history, where API clients and benchmarks can read the counters.
+        status = "\n".join(lines)
+        return {"ui": {"text": [status]}, "result": (status,)}
