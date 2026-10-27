@@ -690,7 +690,7 @@ def test_diagnostics_reports_provider_activation_and_rejection(monkeypatch):
     diagnostics = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(diagnostics)
 
-    status = diagnostics.OmniXPUStatus().get_status()[0]
+    status = diagnostics.OmniXPUStatus().get_status()["result"][0]
 
     assert "runtime providers: active (mode=auto)" in status
     assert "comfy_kitchen.xpu: active" in status
