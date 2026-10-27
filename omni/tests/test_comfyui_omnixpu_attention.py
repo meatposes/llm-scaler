@@ -814,6 +814,80 @@ def test_bmg_attention_open_ended_domain_uses_general_bhld_cute(
     assert patch.get_stats()["routes"] == {route: 1}
 
 
+@pytest.mark.parametrize(
+    ("batch", "heads", "seq", "dtype", "pre_shaped"),
+    [
+        (2, 30, 3952, torch.bfloat16, True),   # Z-Image CFG
+        (3, 30, 3952, torch.bfloat16, True),   # Z-Image latent batch
+        (2, 24, 4608, torch.bfloat16, True),   # Flux/Chroma CFG
+        (2, 24, 7041, torch.bfloat16, True),   # Qwen-Image CFG
+        (2, 40, 32760, torch.float16, False),  # Wan 2.x CFG, dense BLD
+        (2, 40, 32760, torch.bfloat16, False),
+        (4, 32, 4104, torch.bfloat16, True),
+        (6, 48, 768, torch.float16, True),
+    ],
+)
+def test_bmg_batched_self_uses_general_bhld_cute(
+    monkeypatch, batch, heads, seq, dtype, pre_shaped
+):
+    monkeypatch.delenv("OMNIXPU_D128_BATCHED_SELF", raising=False)
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    tensor = _FakeTensor(
+        seq=seq,
+        heads=heads,
+        batch=batch,
+        dtype=dtype,
+        pre_shaped=pre_shaped,
+    )
+    result = attention.optimized_attention(
+        tensor,
+        tensor,
+        tensor,
+        heads=heads,
+        skip_reshape=pre_shaped,
+    )
+    tag = "fp16" if dtype == torch.float16 else "bf16"
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute_d128_bhld"]
+    assert patch.get_stats()["fallback"] == 0
+    assert patch.get_stats()["routes"] == {
+        f"bmg_b{batch}_{tag}_d128_self": 1
+    }
+
+
+@pytest.mark.parametrize(
+    ("batch", "heads", "seq", "dtype", "env"),
+    [
+        (2, 30, 3952, torch.bfloat16, "0"),    # disabled for diagnosis
+        (3, 32, 4104, torch.bfloat16, "off"),
+        (2, 39, 3952, torch.bfloat16, None),   # unmeasured head count
+        (2, 30, 767, torch.bfloat16, None),    # below the self minimum
+        (2, 30, 3952, torch.float32, None),
+        (6, 40, 75600, torch.bfloat16, None),  # beyond the dense element limit
+    ],
+)
+def test_bmg_batched_self_unadmitted_shapes_keep_torch(
+    monkeypatch, batch, heads, seq, dtype, env
+):
+    if env is None:
+        monkeypatch.delenv("OMNIXPU_D128_BATCHED_SELF", raising=False)
+    else:
+        monkeypatch.setenv("OMNIXPU_D128_BATCHED_SELF", env)
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    tensor = _FakeTensor(seq=seq, heads=heads, batch=batch, dtype=dtype)
+    result = attention.optimized_attention(
+        tensor,
+        tensor,
+        tensor,
+        heads=heads,
+        skip_reshape=True,
+    )
+    assert result == "torch-output"
+    assert calls == ["torch"]
+    assert patch.get_stats()["routes"] == {}
+    assert patch.get_stats()["fallback"] == 1
+
+
 def test_bmg_b1_self_keeps_legacy_cute_route(monkeypatch):
     patch, attention, calls = _load_patch(monkeypatch, target="bmg")
     tensor = _FakeTensor(seq=14080, heads=32, batch=1)

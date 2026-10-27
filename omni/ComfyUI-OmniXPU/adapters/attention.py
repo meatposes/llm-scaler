@@ -555,6 +555,42 @@ def _is_animate2_cute_shape(b, heads, dim_head, q_len, kv_len, dtype):
     )
 
 
+_BATCHED_SELF_ENV = "OMNIXPU_D128_BATCHED_SELF"
+# Head counts of the D128 DiTs this route was measured with: Flux, Chroma and
+# Qwen-Image (24), Z-Image (30), Qwen-Image 2.1 and LTX-2 (32), Wan 2.x 14B (40).
+_BATCHED_SELF_HEADS = (24, 28, 30, 32, 40, 48)
+
+
+def _batched_self_enabled():
+    value = os.environ.get(_BATCHED_SELF_ENV, "1").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+def _is_batched_self_cute_shape(b, heads, dim_head, q_len, kv_len, dtype):
+    """Admission for batched (CFG or latent-batch) D128 self-attention.
+
+    Without this route, B>1 self-attention reaches the BMG D128 BHLD CUTE
+    kernel only for B2/heads=32. Every other D128 DiT running with CFG or a
+    batched latent (Z-Image heads=30, Flux/Chroma/Qwen-Image heads=24, Wan
+    heads=40) falls back to Torch SDPA with ``batch=N``. On a B50 the kernel
+    was measured with heads 24/28/30/32/40/48, B2-B6, sequence 768-32760
+    (including odd lengths), FP16 and BF16, packed and BLHD-backed layouts.
+    Against an fp32 reference its error matched Torch SDPA's, and it ran
+    1.09-1.17x faster than Torch SDPA. Set OMNIXPU_D128_BATCHED_SELF=0 to
+    restore the B2/heads=32-only routing for diagnosis.
+    """
+    return (
+        _batched_self_enabled()
+        and b >= 2
+        and heads in _BATCHED_SELF_HEADS
+        and dim_head == 128
+        and dtype in (torch.float16, torch.bfloat16)
+        and q_len == kv_len
+        and q_len >= 768
+        and b * heads * q_len * dim_head <= _CUTE_D128_MAX_DENSE_ELEMENTS
+    )
+
+
 def _prepare_bmg_d128_bhld_cute(
     q,
     k,
@@ -598,11 +634,15 @@ def _prepare_bmg_d128_bhld_cute(
     animate2_attention = _is_animate2_cute_shape(
         b, heads, dim_head, q_len, kv_len, q.dtype
     )
+    batched_self_attention = _is_batched_self_cute_shape(
+        b, heads, dim_head, q_len, kv_len, q.dtype
+    )
     supported_batch_kind = (
         (b == 2 and (self_attention or cross_attention))
         or (b == 1 and cross_attention)
         or minimax_h3_attention
         or animate2_attention
+        or batched_self_attention
         or prefix_rectangular
     )
     if not (
@@ -613,14 +653,22 @@ def _prepare_bmg_d128_bhld_cute(
         and capability()
         and (
             q.dtype == torch.bfloat16
-            or (animate2_attention and q.dtype == torch.float16)
+            or (
+                (animate2_attention or batched_self_attention)
+                and q.dtype == torch.float16
+            )
         )
         and k.dtype == q.dtype
         and v.dtype == q.dtype
         and q.device.type == "xpu"
         and k.device == q.device
         and v.device == q.device
-        and (heads == 32 or minimax_h3_attention or animate2_attention)
+        and (
+            heads == 32
+            or minimax_h3_attention
+            or animate2_attention
+            or batched_self_attention
+        )
         and dim_head == 128
         and supported_batch_kind
     ):
@@ -1116,7 +1164,8 @@ def apply():
             if heads == 56:
                 route = "minimax_h3_h56_bf16_d128_qkv_bhld"
             elif q_len == kv_len:
-                route = "bmg_b2_bf16_d128_self"
+                tag = "fp16" if q.dtype == torch.float16 else "bf16"
+                route = f"bmg_b{b}_{tag}_d128_self"
             elif heads == _ANIMATE2_HEADS:
                 tag = "fp16" if q.dtype == torch.float16 else "bf16"
                 route = (
